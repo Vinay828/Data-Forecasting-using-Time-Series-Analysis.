@@ -1,0 +1,257 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import yfinance as yf
+import streamlit as st
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, LSTM
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import logging
+from datetime import datetime, timedelta
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class StockDataProcessor:
+    """Class to handle stock data loading and preprocessing."""
+
+    def __init__(self, symbol, start_date, end_date):
+        self.symbol = symbol
+        self.start_date = start_date
+        self.end_date = end_date
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        self.data = None
+
+    def load_data(self):
+        """Load stock data from Yahoo Finance."""
+        try:
+            data = yf.download(self.symbol, start=self.start_date, end=self.end_date)
+            if data.empty:
+                raise ValueError(f"No data found for symbol {self.symbol}")
+            self.data = data
+            return data
+        except Exception as e:
+            logger.error(f"Error loading data: {str(e)}")
+            raise
+
+    def prepare_data(self, sequence_length=100, train_size=0.7):
+        """Prepare data for model training and testing."""
+        if self.data is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+
+        # Create DataFrame with only closing prices
+        df = pd.DataFrame(self.data["Close"])
+
+        # Calculate train-test split point
+        train_size = int(len(df) * train_size)
+
+        # Split data into training and testing sets
+        train_data = df[:train_size]
+        test_data = df[train_size:]
+
+        # Scale the data
+        train_scaled = self.scaler.fit_transform(train_data)
+
+        # Create sequences for training
+        x_train, y_train = self._create_sequences(train_scaled, sequence_length)
+
+        # Prepare testing data
+        past_sequence = train_data.tail(sequence_length)
+        test_data = pd.concat([past_sequence, test_data])
+        test_scaled = self.scaler.transform(test_data)
+        x_test, y_test = self._create_sequences(test_scaled, sequence_length)
+
+        return (x_train, y_train), (x_test, y_test)
+
+    def _create_sequences(self, data, sequence_length):
+        """Create sequences for time series prediction."""
+        x, y = [], []
+        for i in range(sequence_length, len(data)):
+            x.append(data[i - sequence_length : i])
+            y.append(data[i, 0])
+        return np.array(x), np.array(y)
+
+    def inverse_transform(self, data):
+        """Inverse transform scaled data."""
+        return self.scaler.inverse_transform(data.reshape(-1, 1))
+
+
+class StockPredictor:
+    """Class to handle model creation, training and prediction."""
+
+    def __init__(self, sequence_length):
+        self.sequence_length = sequence_length
+        self.model = self._build_model()
+
+    def _build_model(self):
+        """Build and compile the LSTM model."""
+        model = Sequential(
+            [
+                LSTM(
+                    50,
+                    activation="relu",
+                    return_sequences=True,
+                    input_shape=(self.sequence_length, 1),
+                ),
+                Dropout(0.2),
+                LSTM(60, activation="relu", return_sequences=False),
+                Dropout(0.3),
+                Dense(32, activation="relu"),
+                Dense(1),
+            ]
+        )
+
+        model.compile(optimizer="adam", loss="mean_squared_error")
+        return model
+
+    def train(self, x_train, y_train, epochs=50, batch_size=32, validation_split=0.1):
+        """Train the model with early stopping."""
+        early_stopping = EarlyStopping(
+            monitor="val_loss", patience=10, restore_best_weights=True
+        )
+
+        history = self.model.fit(
+            x_train,
+            y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_split=validation_split,
+            callbacks=[early_stopping],
+            verbose=1,
+        )
+        return history
+
+    def predict(self, x_test):
+        """Make predictions."""
+        return self.model.predict(x_test)
+
+
+class Visualizer:
+    """Class to handle all visualization tasks."""
+
+    @staticmethod
+    def plot_stock_data(data, title, ma_periods=None):
+        """Plot stock data with optional moving averages."""
+        fig = plt.figure(figsize=(12, 6))
+        plt.plot(data.Close, "b", label="Closing Price")
+
+        if ma_periods:
+            for period in ma_periods:
+                ma = data.Close.rolling(period).mean()
+                plt.plot(ma, label=f"{period}MA")
+
+        plt.title(title)
+        plt.xlabel("Time")
+        plt.ylabel("Price")
+        plt.legend()
+        return fig
+
+    @staticmethod
+    def plot_predictions(y_true, y_pred, title):
+        """Plot actual vs predicted values."""
+        fig = plt.figure(figsize=(12, 6))
+        plt.plot(y_true, "b", label="Actual Price")
+        plt.plot(y_pred, "r", label="Predicted Price")
+        plt.title(title)
+        plt.xlabel("Time")
+        plt.ylabel("Price")
+        plt.legend()
+        return fig
+
+    @staticmethod
+    def plot_training_history(history):
+        """Plot model training history."""
+        fig = plt.figure(figsize=(12, 6))
+        plt.plot(history.history["loss"], label="Training Loss")
+        plt.plot(history.history["val_loss"], label="Validation Loss")
+        plt.title("Model Training History")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend()
+        return fig
+
+
+def calculate_metrics(y_true, y_pred):
+    """Calculate performance metrics."""
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+
+    return {"MSE": mse, "RMSE": rmse, "MAE": mae}
+
+
+def main():
+    st.title("Advanced Stock Market Prediction")
+
+    # Sidebar configuration
+    st.sidebar.header("Configuration")
+    symbol = st.sidebar.text_input("Enter Stock Symbol", "AAPL")
+    years_back = st.sidebar.slider("Years of Historical Data", 1, 10, 5)
+    train_size = st.sidebar.slider("Training Data Size (%)", 60, 90, 70) / 100
+
+    # Calculate dates
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=365 * years_back)
+
+    try:
+        # Initialize processor and load data
+        processor = StockDataProcessor(symbol, start_date, end_date)
+        data = processor.load_data()
+
+        # Display raw data
+        st.subheader("Historical Data")
+        st.write(data.describe())
+
+        # Display basic visualizations
+        visualizer = Visualizer()
+        st.subheader("Stock Price History")
+        fig = visualizer.plot_stock_data(
+            data, "Stock Price History", ma_periods=[100, 200]
+        )
+        st.pyplot(fig)
+
+        # Prepare data for modeling
+        (x_train, y_train), (x_test, y_test) = processor.prepare_data(
+            train_size=train_size
+        )
+
+        # Create and train model
+        predictor = StockPredictor(sequence_length=100)
+        history = predictor.train(x_train, y_train)
+
+        # Plot training history
+        st.subheader("Model Training History")
+        fig = visualizer.plot_training_history(history)
+        st.pyplot(fig)
+
+        # Make predictions
+        y_pred = predictor.predict(x_test)
+
+        # Inverse transform predictions and actual values
+        y_test_inv = processor.inverse_transform(y_test)
+        y_pred_inv = processor.inverse_transform(y_pred)
+
+        # Calculate and display metrics
+        metrics = calculate_metrics(y_test_inv, y_pred_inv)
+        st.subheader("Model Performance Metrics")
+        for metric, value in metrics.items():
+            st.write(f"{metric}: {value:.2f}")
+
+        # Plot predictions
+        st.subheader("Predictions vs Actual Values")
+        fig = visualizer.plot_predictions(
+            y_test_inv, y_pred_inv, "Stock Price Prediction"
+        )
+        st.pyplot(fig)
+
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+        logger.error(f"Application error: {str(e)}", exc_info=True)
+
+
+if __name__ == "__main__":
+    main()
